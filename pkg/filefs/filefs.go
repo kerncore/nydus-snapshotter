@@ -13,8 +13,10 @@
 package filefs
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/containerd/log"
@@ -40,12 +42,14 @@ type snapshotContext struct {
 }
 
 type snapshotState struct {
-	mountPoint  string
-	backingFile string   // path to the EROFS image file (bootstrap)
-	blobIDs     []string // blob IDs from EROFS device table
-	fanotifyFd  int      // fanotify file descriptor
-	stopCh      chan struct{}
-	wg          sync.WaitGroup // tracks fanotify goroutine lifecycle
+	mountPoint      string
+	backingFile     string     // path to the EROFS image file (bootstrap)
+	blobs           []blobInfo // blob metadata from EROFS device table
+	blobDir         string     // directory containing blob sparse files
+	fanotifyFd      int        // fanotify file descriptor
+	stopCh          chan struct{}
+	wg              sync.WaitGroup     // tracks fanotify goroutine lifecycle
+	cancelPrefetch  context.CancelFunc // cancels in-progress blob prefetch
 }
 
 // NewManager creates a new file-backed EROFS mount manager.
@@ -61,6 +65,11 @@ func NewManager(cacheDirPath string, insecure bool) *Manager {
 
 // MountFileErofs mounts an EROFS image file directly using file-backed mount
 // and sets up fanotify pre-content hooks for on-demand data loading.
+//
+// For images with external blobs, sparse placeholder files are created for each
+// blob and passed as device= mount options. A background prefetch fills these
+// files from the remote registry. Fanotify FAN_PRE_CONTENT events block until
+// the needed blob data is available, enabling lazy loading.
 func (m *Manager) MountFileErofs(snapshotID string, r *rafs.Rafs) error {
 	bootstrapFile, err := r.BootstrapFile()
 	if err != nil {
@@ -72,35 +81,58 @@ func (m *Manager) MountFileErofs(snapshotID string, r *rafs.Rafs) error {
 		return errors.Wrapf(err, "create mount dir %s", mountPoint)
 	}
 
-	// File-backed EROFS mount: use the bootstrap file as the source.
-	// The kernel mounts the EROFS image directly from the file without
-	// intermediate loopback block devices.
-	mountOpts := "source=" + bootstrapFile
-	if err := unix.Mount("none", mountPoint, "erofs", unix.MS_RDONLY, mountOpts); err != nil {
-		return errors.Wrapf(err, "file-backed mount erofs at %s from %s", mountPoint, bootstrapFile)
-	}
-	log.L.Infof("File-backed EROFS mounted at %s from %s", mountPoint, bootstrapFile)
-
-	// Parse the EROFS device table to discover referenced blob IDs.
-	blobIDs, err := parseDeviceTable(bootstrapFile)
+	// Parse the EROFS device table to discover referenced blobs (IDs + sizes).
+	blobs, err := parseDeviceTable(bootstrapFile)
 	if err != nil {
 		log.L.WithError(err).Warnf("filefs: failed to parse device table from %s, on-demand fetching may not work", bootstrapFile)
 	}
-	if len(blobIDs) > 0 {
-		log.L.Infof("filefs: discovered %d blob(s) in EROFS device table for snapshot %s", len(blobIDs), snapshotID)
+
+	// Create sparse placeholder files for each blob and build device= mount options.
+	blobDir := filepath.Join(r.GetSnapshotDir(), "blobs")
+	var deviceOpts []string
+	if len(blobs) > 0 {
+		log.L.Infof("filefs: discovered %d blob(s) in EROFS device table for snapshot %s", len(blobs), snapshotID)
+		if err := os.MkdirAll(blobDir, 0750); err != nil {
+			return errors.Wrapf(err, "create blob dir %s", blobDir)
+		}
+		for _, blob := range blobs {
+			blobPath := filepath.Join(blobDir, blob.ID)
+			if err := createSparseFile(blobPath, blob.Size); err != nil {
+				return errors.Wrapf(err, "create sparse blob file %s", blobPath)
+			}
+			deviceOpts = append(deviceOpts, "device="+blobPath)
+		}
 	}
 
+	// File-backed EROFS mount: use the bootstrap file as the source.
+	// The kernel mounts the EROFS image directly from the file without
+	// intermediate loopback block devices. External blob data is referenced
+	// via device= options pointing to regular files (sparse, filled lazily).
+	mountOpts := "source=" + bootstrapFile
+	if len(deviceOpts) > 0 {
+		mountOpts += "," + strings.Join(deviceOpts, ",")
+	}
+	if err := unix.Mount("none", mountPoint, "erofs", unix.MS_RDONLY, mountOpts); err != nil {
+		return errors.Wrapf(err, "file-backed mount erofs at %s from %s (opts: %s)", mountPoint, bootstrapFile, mountOpts)
+	}
+	log.L.Infof("File-backed EROFS mounted at %s from %s with %d device(s)", mountPoint, bootstrapFile, len(deviceOpts))
+
+	// Create cancellable context for background prefetch.
+	prefetchCtx, cancelPrefetch := context.WithCancel(context.Background())
+
 	st := &snapshotState{
-		mountPoint:  mountPoint,
-		backingFile: bootstrapFile,
-		blobIDs:     blobIDs,
-		fanotifyFd:  -1,
-		stopCh:      make(chan struct{}),
+		mountPoint:     mountPoint,
+		backingFile:    bootstrapFile,
+		blobs:          blobs,
+		blobDir:        blobDir,
+		fanotifyFd:     -1,
+		stopCh:         make(chan struct{}),
+		cancelPrefetch: cancelPrefetch,
 	}
 
 	// Set up fanotify for on-demand data loading.
 	if err := m.setupFanotify(st, mountPoint); err != nil {
-		// Clean up mount on fanotify failure.
+		cancelPrefetch()
 		if umountErr := unix.Unmount(mountPoint, 0); umountErr != nil {
 			log.L.WithError(umountErr).Errorf("failed to unmount %s during fanotify setup cleanup", mountPoint)
 		}
@@ -118,8 +150,29 @@ func (m *Manager) MountFileErofs(snapshotID string, r *rafs.Rafs) error {
 	m.snapshotContexts[snapshotID] = sctx
 	m.mu.Unlock()
 
+	// Start background prefetch — downloads blob data into the sparse files.
+	// Fanotify events will block until the needed blobs are fully downloaded.
+	if len(blobs) > 0 {
+		m.fetcher.StartPrefetch(prefetchCtx, r.ImageID, blobs, blobDir)
+	}
+
 	r.SetMountpoint(mountPoint)
 	return nil
+}
+
+// createSparseFile creates a sparse file at path with the given size.
+// If the file already exists with the correct size, it's left as-is.
+func createSparseFile(path string, size int64) error {
+	fi, err := os.Stat(path)
+	if err == nil && fi.Size() == size {
+		return nil // already exists with correct size
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Truncate(size)
 }
 
 // GetSnapshotContext returns the image reference for a snapshot, used by the
@@ -144,6 +197,11 @@ func (m *Manager) UmountFileErofs(snapshotID string) error {
 	delete(m.snapshots, snapshotID)
 	delete(m.snapshotContexts, snapshotID)
 	m.mu.Unlock()
+
+	// Cancel in-progress blob prefetches.
+	if st.cancelPrefetch != nil {
+		st.cancelPrefetch()
+	}
 
 	// Signal the fanotify goroutine to stop and wait for it to exit.
 	close(st.stopCh)

@@ -9,6 +9,7 @@
 package filefs
 
 import (
+	"context"
 	"sync"
 	"testing"
 
@@ -36,7 +37,6 @@ func TestManager_GetSnapshotContext_NotFound(t *testing.T) {
 func TestManager_GetSnapshotContext_Found(t *testing.T) {
 	m := NewManager(t.TempDir(), false)
 
-	// Manually register a snapshot context.
 	m.mu.Lock()
 	m.snapshotContexts["snap-1"] = &snapshotContext{
 		imageRef: "docker.io/library/nginx:latest",
@@ -51,16 +51,12 @@ func TestManager_GetSnapshotContext_Found(t *testing.T) {
 
 func TestManager_UmountFileErofs_NotFound(t *testing.T) {
 	m := NewManager(t.TempDir(), false)
-
-	// Umounting a nonexistent snapshot should be a no-op (return nil).
 	err := m.UmountFileErofs("nonexistent")
 	assert.NoError(t, err)
 }
 
 func TestManager_TeardownAll_Empty(t *testing.T) {
 	m := NewManager(t.TempDir(), false)
-
-	// TeardownAll on empty manager should not panic.
 	m.TeardownAll()
 
 	m.mu.Lock()
@@ -68,21 +64,22 @@ func TestManager_TeardownAll_Empty(t *testing.T) {
 	m.mu.Unlock()
 }
 
+func makeTestSnapshotState() *snapshotState {
+	_, cancel := context.WithCancel(context.Background())
+	return &snapshotState{
+		mountPoint:     "",
+		fanotifyFd:     -1,
+		stopCh:         make(chan struct{}),
+		cancelPrefetch: cancel,
+	}
+}
+
 func TestManager_TeardownAll_CleansSnapshots(t *testing.T) {
 	m := NewManager(t.TempDir(), false)
 
-	// Manually add snapshot states (without real mounts — we test state tracking only).
 	m.mu.Lock()
-	m.snapshots["snap-1"] = &snapshotState{
-		mountPoint: "",
-		fanotifyFd: -1,
-		stopCh:     make(chan struct{}),
-	}
-	m.snapshots["snap-2"] = &snapshotState{
-		mountPoint: "",
-		fanotifyFd: -1,
-		stopCh:     make(chan struct{}),
-	}
+	m.snapshots["snap-1"] = makeTestSnapshotState()
+	m.snapshots["snap-2"] = makeTestSnapshotState()
 	m.snapshotContexts["snap-1"] = &snapshotContext{imageRef: "img1"}
 	m.snapshotContexts["snap-2"] = &snapshotContext{imageRef: "img2"}
 	m.mu.Unlock()
@@ -101,7 +98,6 @@ func TestManager_ConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 	const goroutines = 20
 
-	// Half the goroutines add snapshot contexts, half remove them.
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func(id int) {
@@ -121,24 +117,18 @@ func TestManager_ConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
-	// If we get here without -race failures, concurrent access is safe.
 }
 
 func TestManager_SnapshotStateTracking(t *testing.T) {
 	m := NewManager(t.TempDir(), false)
 
-	// Register a snapshot.
-	st := &snapshotState{
-		mountPoint:  "/mnt/test",
-		backingFile: "/data/bootstrap",
-		fanotifyFd:  -1,
-		stopCh:      make(chan struct{}),
-	}
+	st := makeTestSnapshotState()
+	st.mountPoint = "/mnt/test"
+	st.backingFile = "/data/bootstrap"
 	m.mu.Lock()
 	m.snapshots["snap-track"] = st
 	m.mu.Unlock()
 
-	// Verify it's tracked.
 	m.mu.Lock()
 	got, ok := m.snapshots["snap-track"]
 	m.mu.Unlock()
@@ -146,11 +136,34 @@ func TestManager_SnapshotStateTracking(t *testing.T) {
 	assert.Equal(t, "/mnt/test", got.mountPoint)
 	assert.Equal(t, "/data/bootstrap", got.backingFile)
 
-	// Umount removes it (no real mount to undo since mountPoint won't exist).
+	// Umount removes it (no real mount since mountPoint is empty string).
 	_ = m.UmountFileErofs("snap-track")
 
 	m.mu.Lock()
 	_, ok = m.snapshots["snap-track"]
 	m.mu.Unlock()
 	assert.False(t, ok, "snapshot should be removed after umount")
+}
+
+func TestManager_UmountCancelsPrefetch(t *testing.T) {
+	m := NewManager(t.TempDir(), false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	st := &snapshotState{
+		mountPoint:     "",
+		fanotifyFd:     -1,
+		stopCh:         make(chan struct{}),
+		cancelPrefetch: cancel,
+	}
+
+	m.mu.Lock()
+	m.snapshots["snap-cancel"] = st
+	m.mu.Unlock()
+
+	err := m.UmountFileErofs("snap-cancel")
+	assert.NoError(t, err)
+
+	// Verify the context was cancelled.
+	assert.Error(t, ctx.Err())
+	assert.ErrorIs(t, ctx.Err(), context.Canceled)
 }

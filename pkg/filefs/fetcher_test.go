@@ -10,189 +10,208 @@ package filefs
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 
-	"github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestFetchBlob_CacheHit(t *testing.T) {
-	cacheDir := t.TempDir()
-	fetcher := NewDataFetcher(cacheDir, true)
+func TestNewDataFetcher(t *testing.T) {
+	f := NewDataFetcher("/tmp/cache", false)
+	require.NotNil(t, f)
+	assert.Equal(t, "/tmp/cache", f.cacheDirPath)
+	assert.False(t, f.insecure)
+	assert.NotNil(t, f.fetched)
+	assert.NotNil(t, f.downloads)
+	assert.NotNil(t, f.downloadErrs)
+	assert.NotNil(t, f.sem)
 
-	blobContent := []byte("cached blob data")
-	blobDigest := digest.FromBytes(blobContent)
-	blobID := blobDigest.Hex()
-
-	// Pre-create the blob in cache.
-	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, blobID), blobContent, 0644))
-
-	var requestCount atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount.Add(1)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	// FetchBlob should see the cached file and not make any HTTP requests.
-	err := fetcher.FetchBlob(context.Background(), "docker.io/library/test:latest", blobDigest)
-	assert.NoError(t, err)
-	assert.Equal(t, int32(0), requestCount.Load(), "no HTTP requests should be made for cached blobs")
+	f2 := NewDataFetcher("/tmp/insecure", true)
+	assert.True(t, f2.insecure)
 }
 
-func TestFetchBlob_SingleflightDedup(t *testing.T) {
-	cacheDir := t.TempDir()
-	fetcher := NewDataFetcher(cacheDir, true)
+func TestWaitForBlobs_Empty(t *testing.T) {
+	f := NewDataFetcher(t.TempDir(), true)
+	err := f.WaitForBlobs(context.Background(), nil)
+	assert.NoError(t, err)
+}
 
-	blobContent := []byte("singleflight test blob")
-	blobDigest := digest.FromBytes(blobContent)
+func TestWaitForBlobs_AllAlreadyFetched(t *testing.T) {
+	f := NewDataFetcher(t.TempDir(), true)
 
-	var requestCount atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount.Add(1)
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(blobContent)
-	}))
-	defer srv.Close()
+	f.mu.Lock()
+	f.fetched["blob1"] = true
+	f.fetched["blob2"] = true
+	f.mu.Unlock()
 
-	// Note: FetchBlob uses the remote registry infrastructure (auth + resolver)
-	// which means we can't easily point it at our httptest server without
-	// mocking the entire remote.Remote chain. Instead, we test the singleflight
-	// dedup property indirectly by verifying that calling FetchBlob twice for
-	// a blob that is already in cache (after first manual placement) only hits
-	// the fast path.
-	blobID := blobDigest.Hex()
-	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, blobID), blobContent, 0644))
+	blobs := []blobInfo{
+		{ID: "blob1", Size: 1024},
+		{ID: "blob2", Size: 2048},
+	}
+	err := f.WaitForBlobs(context.Background(), blobs)
+	assert.NoError(t, err)
+}
+
+func TestWaitForBlobs_WaitsForDownload(t *testing.T) {
+	f := NewDataFetcher(t.TempDir(), true)
+
+	ch := make(chan struct{})
+	f.mu.Lock()
+	f.downloads["blob1"] = ch
+	f.mu.Unlock()
+
+	blobs := []blobInfo{{ID: "blob1", Size: 1024}}
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 10)
+	var waitErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		waitErr = f.WaitForBlobs(context.Background(), blobs)
+	}()
 
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := fetcher.FetchBlob(context.Background(), "docker.io/library/test:latest", blobDigest)
-			if err != nil {
-				errCh <- err
-			}
-		}()
-	}
+	// Simulate download completion.
+	f.mu.Lock()
+	f.fetched["blob1"] = true
+	f.mu.Unlock()
+	close(ch)
+
 	wg.Wait()
-	close(errCh)
+	assert.NoError(t, waitErr)
+}
 
-	for err := range errCh {
-		t.Errorf("unexpected error: %v", err)
+func TestWaitForBlobs_DownloadError(t *testing.T) {
+	f := NewDataFetcher(t.TempDir(), true)
+
+	ch := make(chan struct{})
+	f.mu.Lock()
+	f.downloads["blob1"] = ch
+	f.downloadErrs["blob1"] = assert.AnError
+	f.mu.Unlock()
+	close(ch)
+
+	blobs := []blobInfo{{ID: "blob1", Size: 1024}}
+	err := f.WaitForBlobs(context.Background(), blobs)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "download failed")
+}
+
+func TestWaitForBlobs_ContextCancelled(t *testing.T) {
+	f := NewDataFetcher(t.TempDir(), true)
+
+	ch := make(chan struct{}) // never closes
+	f.mu.Lock()
+	f.downloads["blob1"] = ch
+	f.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	blobs := []blobInfo{{ID: "blob1", Size: 1024}}
+	err := f.WaitForBlobs(ctx, blobs)
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestStartPrefetch_SkipsAlreadyFetched(t *testing.T) {
+	f := NewDataFetcher(t.TempDir(), true)
+
+	f.mu.Lock()
+	f.fetched["blob1"] = true
+	f.mu.Unlock()
+
+	blobs := []blobInfo{{ID: "blob1", Size: 1024}}
+	f.StartPrefetch(context.Background(), "test-image", blobs, t.TempDir())
+
+	f.mu.RLock()
+	_, exists := f.downloads["blob1"]
+	f.mu.RUnlock()
+	assert.False(t, exists, "should not create download for already-fetched blob")
+}
+
+func TestStartPrefetch_SkipsDuplicateDownloads(t *testing.T) {
+	f := NewDataFetcher(t.TempDir(), true)
+
+	existing := make(chan struct{})
+	f.mu.Lock()
+	f.downloads["blob1"] = existing
+	f.mu.Unlock()
+
+	blobs := []blobInfo{{ID: "blob1", Size: 1024}}
+	f.StartPrefetch(context.Background(), "test-image", blobs, t.TempDir())
+
+	f.mu.RLock()
+	ch := f.downloads["blob1"]
+	f.mu.RUnlock()
+	assert.Equal(t, existing, ch, "should keep existing download channel")
+}
+
+func TestFetchBlobToFile_InvalidBlobID(t *testing.T) {
+	f := NewDataFetcher(t.TempDir(), true)
+
+	err := f.fetchBlobToFile(context.Background(), "test-image", "not-a-hex", "/tmp/target")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid blob ID")
+}
+
+func TestFetchBlobToFile_CancelledContext(t *testing.T) {
+	f := NewDataFetcher(t.TempDir(), true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := f.fetchBlobToFile(ctx, "test-image",
+		"abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+		"/tmp/target")
+	assert.Error(t, err)
+}
+
+func TestWaitForBlobs_MultipleBlobs(t *testing.T) {
+	f := NewDataFetcher(t.TempDir(), true)
+
+	ch1 := make(chan struct{})
+	ch2 := make(chan struct{})
+	f.mu.Lock()
+	f.downloads["blob1"] = ch1
+	f.downloads["blob2"] = ch2
+	f.mu.Unlock()
+
+	blobs := []blobInfo{
+		{ID: "blob1", Size: 1024},
+		{ID: "blob2", Size: 2048},
 	}
 
-	// All 10 goroutines should have hit the cache fast path.
-	assert.Equal(t, int32(0), requestCount.Load(), "all requests should hit cache")
+	var wg sync.WaitGroup
+	var waitErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		waitErr = f.WaitForBlobs(context.Background(), blobs)
+	}()
+
+	// Complete both downloads.
+	f.mu.Lock()
+	f.fetched["blob1"] = true
+	f.fetched["blob2"] = true
+	f.mu.Unlock()
+	close(ch1)
+	close(ch2)
+
+	wg.Wait()
+	assert.NoError(t, waitErr)
 }
 
-func TestEnsureAllBlobsFetched_AllCached(t *testing.T) {
-	cacheDir := t.TempDir()
-	fetcher := NewDataFetcher(cacheDir, true)
+func TestBlobDir_SparseFileCreation(t *testing.T) {
+	blobDir := t.TempDir()
+	blobID := "test1234test1234test1234test1234test1234test1234test1234test1234"
+	blobPath := filepath.Join(blobDir, blobID)
 
-	blob1 := []byte("blob1 data")
-	blob2 := []byte("blob2 data")
-	d1 := digest.FromBytes(blob1)
-	d2 := digest.FromBytes(blob2)
+	require.NoError(t, createSparseFile(blobPath, 4096))
 
-	// Pre-create both blobs in cache.
-	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, d1.Hex()), blob1, 0644))
-	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, d2.Hex()), blob2, 0644))
-
-	err := fetcher.EnsureAllBlobsFetched(context.Background(), "docker.io/library/test:latest", []string{d1.Hex(), d2.Hex()})
-	assert.NoError(t, err)
-
-	// Both should be marked as fetched.
-	fetcher.mu.RLock()
-	assert.True(t, fetcher.fetched[d1.Hex()])
-	assert.True(t, fetcher.fetched[d2.Hex()])
-	fetcher.mu.RUnlock()
-}
-
-func TestEnsureAllBlobsFetched_Empty(t *testing.T) {
-	fetcher := NewDataFetcher(t.TempDir(), true)
-
-	// Empty blob list should be a no-op.
-	err := fetcher.EnsureAllBlobsFetched(context.Background(), "docker.io/library/test:latest", nil)
-	assert.NoError(t, err)
-}
-
-func TestNewDataFetcher(t *testing.T) {
-	tests := map[string]struct {
-		cacheDir string
-		insecure bool
-	}{
-		"secure fetcher": {
-			cacheDir: "/tmp/test-cache",
-			insecure: false,
-		},
-		"insecure fetcher": {
-			cacheDir: "/tmp/test-cache-insecure",
-			insecure: true,
-		},
-	}
-
-	for name, tc := range tests {
-		t.Run(name, func(t *testing.T) {
-			f := NewDataFetcher(tc.cacheDir, tc.insecure)
-			require.NotNil(t, f)
-			assert.Equal(t, tc.cacheDir, f.cacheDirPath)
-			assert.Equal(t, tc.insecure, f.insecure)
-			assert.NotNil(t, f.fetched)
-		})
-	}
-}
-
-func TestFetchBlob_MarksFetchedAfterCacheHit(t *testing.T) {
-	cacheDir := t.TempDir()
-	fetcher := NewDataFetcher(cacheDir, true)
-
-	blobContent := []byte("test data")
-	blobDigest := digest.FromBytes(blobContent)
-	blobID := blobDigest.Hex()
-
-	// Pre-create in cache.
-	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, blobID), blobContent, 0644))
-
-	// First call should check stat and mark as fetched.
-	err := fetcher.FetchBlob(context.Background(), "docker.io/library/test:latest", blobDigest)
+	fi, err := os.Stat(blobPath)
 	require.NoError(t, err)
-
-	// Verify the fetched map was updated.
-	fetcher.mu.RLock()
-	assert.True(t, fetcher.fetched[blobID], "blob should be marked as fetched")
-	fetcher.mu.RUnlock()
-
-	// Second call should hit the in-memory fast path (no stat needed).
-	err = fetcher.FetchBlob(context.Background(), "docker.io/library/test:latest", blobDigest)
-	assert.NoError(t, err)
-}
-
-func TestEnsureAllBlobsFetched_FastPathAfterFetch(t *testing.T) {
-	cacheDir := t.TempDir()
-	fetcher := NewDataFetcher(cacheDir, true)
-
-	blob := []byte("test blob")
-	d := digest.FromBytes(blob)
-	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, d.Hex()), blob, 0644))
-
-	blobIDs := []string{d.Hex()}
-
-	// First call fetches from cache.
-	err := fetcher.EnsureAllBlobsFetched(context.Background(), "docker.io/library/test:latest", blobIDs)
-	require.NoError(t, err)
-
-	// Second call should hit the in-memory fast path.
-	err = fetcher.EnsureAllBlobsFetched(context.Background(), "docker.io/library/test:latest", blobIDs)
-	assert.NoError(t, err)
+	assert.Equal(t, int64(4096), fi.Size())
 }

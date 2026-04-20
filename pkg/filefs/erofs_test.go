@@ -20,7 +20,7 @@ import (
 
 // writeTestErofsImage creates a minimal EROFS image file with the given
 // superblock fields and device table entries for testing.
-func writeTestErofsImage(t *testing.T, sb erofsSuperBlock, blobIDs []string) string {
+func writeTestErofsImage(t *testing.T, sb erofsSuperBlock, slots []erofsDeviceSlot) string {
 	t.Helper()
 	imgPath := filepath.Join(t.TempDir(), "test.boot")
 	f, err := os.Create(imgPath)
@@ -35,22 +35,13 @@ func writeTestErofsImage(t *testing.T, sb erofsSuperBlock, blobIDs []string) str
 	// Write superblock.
 	require.NoError(t, binary.Write(f, binary.LittleEndian, &sb))
 
-	// If there are blob IDs, write device slots at the offset indicated by DevtSlotOff.
-	if len(blobIDs) > 0 {
+	// If there are slots, write them at the offset indicated by DevtSlotOff.
+	if len(slots) > 0 {
 		devTableOffset := int64(sb.DevtSlotOff) * erofsDeviceSlotSize
-		currentPos := int64(erofsSuperOffset) + int64(erofsSuperReadSize)
-		if devTableOffset > currentPos {
-			gap := make([]byte, devTableOffset-currentPos)
-			_, err = f.Write(gap)
-			require.NoError(t, err)
-		}
-		// Seek to exact position in case of overlap.
 		_, err = f.Seek(devTableOffset, 0)
 		require.NoError(t, err)
 
-		for _, id := range blobIDs {
-			var slot erofsDeviceSlot
-			copy(slot.Tag[:], id)
+		for _, slot := range slots {
 			require.NoError(t, binary.Write(f, binary.LittleEndian, &slot))
 		}
 	}
@@ -58,25 +49,68 @@ func writeTestErofsImage(t *testing.T, sb erofsSuperBlock, blobIDs []string) str
 	return imgPath
 }
 
-func TestParseDeviceTable_ValidImage(t *testing.T) {
-	blobIDs := []string{
-		"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-		"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-	}
+// makeSlot creates a device slot with the given blob ID, block count and hi bits.
+func makeSlot(blobID string, blocksLo uint32, blocksHi uint16) erofsDeviceSlot {
+	var slot erofsDeviceSlot
+	copy(slot.Tag[:], blobID)
+	slot.BlocksLo = blocksLo
+	slot.BlocksHi = blocksHi
+	return slot
+}
 
-	// Place device table at slot offset 9 (byte offset 9*128=1152, after the superblock).
+func TestParseDeviceTable_ValidImage(t *testing.T) {
+	blobID1 := "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+	blobID2 := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+	// BlkSzBits=12 means block size = 4096 bytes.
 	sb := erofsSuperBlock{
 		Magic:           erofsSuperMagicV1,
+		BlkSzBits:       12,
 		FeatureIncompat: erofsFeatureIncompatDeviceTable,
 		ExtraDevices:    2,
 		DevtSlotOff:     9,
 	}
 
-	imgPath := writeTestErofsImage(t, sb, blobIDs)
+	slots := []erofsDeviceSlot{
+		makeSlot(blobID1, 256, 0), // 256 blocks * 4096 = 1048576 bytes (1MB)
+		makeSlot(blobID2, 512, 0), // 512 blocks * 4096 = 2097152 bytes (2MB)
+	}
+
+	imgPath := writeTestErofsImage(t, sb, slots)
 
 	got, err := parseDeviceTable(imgPath)
 	require.NoError(t, err)
-	assert.Equal(t, blobIDs, got)
+	require.Len(t, got, 2)
+
+	assert.Equal(t, blobID1, got[0].ID)
+	assert.Equal(t, int64(256*4096), got[0].Size)
+
+	assert.Equal(t, blobID2, got[1].ID)
+	assert.Equal(t, int64(512*4096), got[1].Size)
+}
+
+func TestParseDeviceTable_BlobSizeWithHighBits(t *testing.T) {
+	blobID := "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+
+	sb := erofsSuperBlock{
+		Magic:           erofsSuperMagicV1,
+		BlkSzBits:       12,
+		FeatureIncompat: erofsFeatureIncompatDeviceTable,
+		ExtraDevices:    1,
+		DevtSlotOff:     9,
+	}
+
+	// BlocksHi=1, BlocksLo=0 → blocks = 1<<32 = 4294967296, size = 4294967296 * 4096
+	slots := []erofsDeviceSlot{
+		makeSlot(blobID, 0, 1),
+	}
+
+	imgPath := writeTestErofsImage(t, sb, slots)
+
+	got, err := parseDeviceTable(imgPath)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, int64((uint64(1)<<32)<<12), got[0].Size)
 }
 
 func TestParseDeviceTable_NoDevices(t *testing.T) {
@@ -96,8 +130,8 @@ func TestParseDeviceTable_NoDevices(t *testing.T) {
 func TestParseDeviceTable_NoDeviceTableFeature(t *testing.T) {
 	sb := erofsSuperBlock{
 		Magic:           erofsSuperMagicV1,
-		FeatureIncompat: 0, // no device table feature
-		ExtraDevices:    2, // ignored since feature flag is off
+		FeatureIncompat: 0,
+		ExtraDevices:    2,
 	}
 
 	imgPath := writeTestErofsImage(t, sb, nil)
@@ -108,10 +142,7 @@ func TestParseDeviceTable_NoDeviceTableFeature(t *testing.T) {
 }
 
 func TestParseDeviceTable_BadMagic(t *testing.T) {
-	sb := erofsSuperBlock{
-		Magic: 0xDEADBEEF,
-	}
-
+	sb := erofsSuperBlock{Magic: 0xDEADBEEF}
 	imgPath := writeTestErofsImage(t, sb, nil)
 
 	_, err := parseDeviceTable(imgPath)
@@ -125,42 +156,53 @@ func TestParseDeviceTable_FileNotFound(t *testing.T) {
 }
 
 func TestParseDeviceTable_EmptyTagsSkipped(t *testing.T) {
-	// One valid blob ID, one empty tag.
 	sb := erofsSuperBlock{
 		Magic:           erofsSuperMagicV1,
+		BlkSzBits:       12,
 		FeatureIncompat: erofsFeatureIncompatDeviceTable,
 		ExtraDevices:    2,
 		DevtSlotOff:     9,
 	}
 
-	// Write image with two slots, but second has empty tag.
-	imgPath := filepath.Join(t.TempDir(), "test.boot")
-	f, err := os.Create(imgPath)
-	require.NoError(t, err)
-	defer f.Close()
+	validID := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+	slots := []erofsDeviceSlot{
+		makeSlot(validID, 100, 0),
+		{}, // empty tag — should be skipped
+	}
 
-	// Padding to superblock.
-	padding := make([]byte, erofsSuperOffset)
-	_, err = f.Write(padding)
-	require.NoError(t, err)
-
-	// Superblock.
-	require.NoError(t, binary.Write(f, binary.LittleEndian, &sb))
-
-	// Seek to device table.
-	_, err = f.Seek(int64(sb.DevtSlotOff)*erofsDeviceSlotSize, 0)
-	require.NoError(t, err)
-
-	// Slot 1: valid blob ID.
-	var slot1 erofsDeviceSlot
-	copy(slot1.Tag[:], "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
-	require.NoError(t, binary.Write(f, binary.LittleEndian, &slot1))
-
-	// Slot 2: empty tag (all zeros).
-	var slot2 erofsDeviceSlot
-	require.NoError(t, binary.Write(f, binary.LittleEndian, &slot2))
+	imgPath := writeTestErofsImage(t, sb, slots)
 
 	got, err := parseDeviceTable(imgPath)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"}, got)
+	require.Len(t, got, 1)
+	assert.Equal(t, validID, got[0].ID)
+	assert.Equal(t, int64(100*4096), got[0].Size)
+}
+
+func TestCreateSparseFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sparse.blob")
+
+	err := createSparseFile(path, 1024*1024) // 1MB
+	require.NoError(t, err)
+
+	fi, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1024*1024), fi.Size())
+
+	// Calling again with same size should be a no-op.
+	err = createSparseFile(path, 1024*1024)
+	require.NoError(t, err)
+}
+
+func TestCreateSparseFile_ZeroSize(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "zero.blob")
+
+	err := createSparseFile(path, 0)
+	require.NoError(t, err)
+
+	fi, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), fi.Size())
 }

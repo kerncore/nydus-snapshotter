@@ -248,29 +248,14 @@ func (m *Manager) handlePreAccessEvent(st *snapshotState, meta *fanotifyEventMet
 	m.sendFanotifyResponse(st, meta.Fd, fanotifyResponseAllow)
 }
 
-// ensureSnapshotBlobsFetched ensures all blobs referenced by the snapshot's
-// EROFS image are available in the local cache. Uses the snapshot context to
-// obtain the image reference for registry authentication.
+// ensureSnapshotBlobsFetched waits for all blobs referenced by the snapshot
+// to be fully downloaded. Downloads are started at mount time by StartPrefetch;
+// this method blocks until they complete.
 func (m *Manager) ensureSnapshotBlobsFetched(st *snapshotState) error {
-	if len(st.blobIDs) == 0 {
+	if len(st.blobs) == 0 {
 		return nil
 	}
-
-	// Look up the image reference for auth credentials.
-	// We need the manager lock briefly to read the snapshot context.
-	m.mu.Lock()
-	var imageRef string
-	for sid, s := range m.snapshots {
-		if s == st {
-			if sctx, ok := m.snapshotContexts[sid]; ok {
-				imageRef = sctx.imageRef
-			}
-			break
-		}
-	}
-	m.mu.Unlock()
-
-	return m.fetcher.EnsureAllBlobsFetched(context.Background(), imageRef, st.blobIDs)
+	return m.fetcher.WaitForBlobs(context.Background(), st.blobs)
 }
 
 // sendFanotifyResponse writes a fanotify_response struct to allow or deny an event.

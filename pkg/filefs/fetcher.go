@@ -21,20 +21,34 @@ import (
 	"github.com/containerd/nydus-snapshotter/pkg/remote/remotes"
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
 )
 
+const (
+	// Maximum number of concurrent blob downloads.
+	maxConcurrentDownloads = 3
+)
+
 // DataFetcher handles on-demand data retrieval for file-backed EROFS mounts.
-// It integrates with the existing blob cache infrastructure to fetch data
-// from local cache or remote registries.
+// It downloads blob data from remote registries into local files that the
+// kernel's EROFS driver reads via file-backed mount device= references.
 type DataFetcher struct {
 	cacheDirPath string
 	insecure     bool
-	mu           sync.RWMutex
-	// Track blobs that have already been fully fetched to avoid redundant work.
+
+	mu sync.RWMutex
+	// Track blobs that have been fully fetched to avoid redundant work.
 	fetched map[string]bool
+	// Per-blob download completion channels: closed when download finishes.
+	downloads map[string]chan struct{}
+	// Per-blob download errors (set before channel close).
+	downloadErrs map[string]error
+
 	// Dedup concurrent fetches for the same blob.
 	sg singleflight.Group
+	// Limit concurrent downloads.
+	sem *semaphore.Weighted
 }
 
 // NewDataFetcher creates a DataFetcher backed by the given cache directory.
@@ -43,23 +57,66 @@ func NewDataFetcher(cacheDirPath string, insecure bool) *DataFetcher {
 		cacheDirPath: cacheDirPath,
 		insecure:     insecure,
 		fetched:      make(map[string]bool),
+		downloads:    make(map[string]chan struct{}),
+		downloadErrs: make(map[string]error),
+		sem:          semaphore.NewWeighted(maxConcurrentDownloads),
 	}
 }
 
-// EnsureAllBlobsFetched ensures all blobs referenced by the EROFS image are
-// available in the local cache. This is called on fanotify pre-access events
-// to ensure blob data is present before the kernel reads it.
-// The blob IDs are extracted from the EROFS device table at mount time.
-func (f *DataFetcher) EnsureAllBlobsFetched(ctx context.Context, imageRef string, blobIDs []string) error {
-	if len(blobIDs) == 0 {
+// StartPrefetch starts background goroutines to download all blobs for a snapshot.
+// Each blob is downloaded into blobDir/<blobID> (the sparse file passed as device=
+// to the EROFS mount). Downloads are rate-limited to maxConcurrentDownloads.
+func (f *DataFetcher) StartPrefetch(ctx context.Context, imageRef string, blobs []blobInfo, blobDir string) {
+	log.L.Infof("filefs: starting background prefetch for %d blob(s)", len(blobs))
+
+	for _, blob := range blobs {
+		blobID := blob.ID
+		targetPath := filepath.Join(blobDir, blobID)
+
+		// Create completion channel.
+		f.mu.Lock()
+		if f.fetched[blobID] {
+			f.mu.Unlock()
+			continue
+		}
+		if _, exists := f.downloads[blobID]; exists {
+			f.mu.Unlock()
+			continue // already downloading
+		}
+		ch := make(chan struct{})
+		f.downloads[blobID] = ch
+		f.mu.Unlock()
+
+		go func(id string, path string, done chan struct{}) {
+			err := f.fetchBlobToFile(ctx, imageRef, id, path)
+
+			f.mu.Lock()
+			if err != nil {
+				f.downloadErrs[id] = err
+				log.L.WithError(err).Errorf("filefs: failed to prefetch blob %s", id)
+			} else {
+				f.fetched[id] = true
+				log.L.Infof("filefs: prefetched blob %s to %s", id, path)
+			}
+			f.mu.Unlock()
+
+			close(done)
+		}(blobID, targetPath, ch)
+	}
+}
+
+// WaitForBlobs blocks until all specified blobs are fully downloaded.
+// Returns the first error encountered, or nil if all blobs are available.
+func (f *DataFetcher) WaitForBlobs(ctx context.Context, blobs []blobInfo) error {
+	if len(blobs) == 0 {
 		return nil
 	}
 
-	// Fast path: check if all blobs are already fetched.
+	// Fast path: all blobs already fetched.
 	f.mu.RLock()
 	allFetched := true
-	for _, id := range blobIDs {
-		if !f.fetched[id] {
+	for _, b := range blobs {
+		if !f.fetched[b.ID] {
 			allFetched = false
 			break
 		}
@@ -69,72 +126,64 @@ func (f *DataFetcher) EnsureAllBlobsFetched(ctx context.Context, imageRef string
 		return nil
 	}
 
-	// Fetch any missing blobs.
-	var firstErr error
-	for _, blobID := range blobIDs {
-		blobDigest, err := digest.Parse("sha256:" + blobID)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = errors.Wrapf(err, "invalid blob ID %s", blobID)
-			}
+	// Wait for each blob's download to complete.
+	for _, b := range blobs {
+		f.mu.RLock()
+		if f.fetched[b.ID] {
+			f.mu.RUnlock()
 			continue
 		}
-		if err := f.FetchBlob(ctx, imageRef, blobDigest); err != nil {
-			if firstErr == nil {
-				firstErr = err
+		ch := f.downloads[b.ID]
+		f.mu.RUnlock()
+
+		if ch == nil {
+			// No download in progress and not fetched — shouldn't happen
+			// if StartPrefetch was called, but handle gracefully.
+			return errors.Errorf("blob %s has no active download", b.ID)
+		}
+
+		select {
+		case <-ch:
+			// Download completed — check for errors.
+			f.mu.RLock()
+			err := f.downloadErrs[b.ID]
+			f.mu.RUnlock()
+			if err != nil {
+				return errors.Wrapf(err, "blob %s download failed", b.ID)
 			}
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
-	return firstErr
-}
 
-// FetchBlob fetches a blob by digest from the remote registry and stores it
-// in the local cache. Uses singleflight to dedup concurrent requests for the
-// same blob. imageRef is the container image reference (e.g. "docker.io/library/nginx:latest").
-func (f *DataFetcher) FetchBlob(ctx context.Context, imageRef string, blobDigest digest.Digest) error {
-	blobID := blobDigest.Hex()
-
-	// Fast path: already cached.
-	f.mu.RLock()
-	if f.fetched[blobID] {
-		f.mu.RUnlock()
-		return nil
-	}
-	f.mu.RUnlock()
-
-	cachePath := filepath.Join(f.cacheDirPath, blobID)
-	if _, err := os.Stat(cachePath); err == nil {
-		f.mu.Lock()
-		f.fetched[blobID] = true
-		f.mu.Unlock()
-		return nil
-	}
-
-	// Use singleflight to dedup concurrent fetches for the same blob.
-	_, err, _ := f.sg.Do(blobID, func() (interface{}, error) {
-		return nil, f.fetchFromRemote(ctx, imageRef, blobDigest, cachePath)
-	})
-	if err != nil {
-		return err
-	}
-
-	f.mu.Lock()
-	f.fetched[blobID] = true
-	f.mu.Unlock()
 	return nil
 }
 
-// fetchFromRemote downloads a blob from the remote registry and saves it
-// to the local cache directory using atomic write (tmp + rename).
-// Follows the same pattern as pkg/tarfs/tarfs.go getBlobStream + blobProcess.
-//
-// TODO(filefs): Currently downloads entire blobs at once. For large layers,
-// implement chunked/range-based fetching similar to
-// pkg/remote/remotes/docker/fetcher.go:open() which supports HTTP Range
-// requests via Content-Range headers and offset-based reads. This would
-// allow fetching only the data chunks needed by each fanotify event,
-// significantly reducing initial I/O latency for large images.
-func (f *DataFetcher) fetchFromRemote(ctx context.Context, imageRef string, blobDigest digest.Digest, cachePath string) error {
+// fetchBlobToFile downloads a blob from the remote registry and writes it
+// directly to targetPath (the sparse file mounted as a device= for EROFS).
+// Uses singleflight to dedup and a semaphore to limit concurrency.
+func (f *DataFetcher) fetchBlobToFile(ctx context.Context, imageRef, blobID, targetPath string) error {
+	// Acquire semaphore slot for rate limiting.
+	if err := f.sem.Acquire(ctx, 1); err != nil {
+		return errors.Wrap(err, "acquire download semaphore")
+	}
+	defer f.sem.Release(1)
+
+	blobDigest, err := digest.Parse("sha256:" + blobID)
+	if err != nil {
+		return errors.Wrapf(err, "invalid blob ID %s", blobID)
+	}
+
+	// Use singleflight to dedup concurrent fetches for the same blob.
+	_, sfErr, _ := f.sg.Do(blobID, func() (interface{}, error) {
+		return nil, f.downloadBlob(ctx, imageRef, blobDigest, targetPath)
+	})
+	return sfErr
+}
+
+// downloadBlob downloads a blob from the remote registry and writes it to targetPath.
+// Writes to a temporary file first, then renames to the target for atomicity.
+func (f *DataFetcher) downloadBlob(ctx context.Context, imageRef string, blobDigest digest.Digest, targetPath string) error {
 	// 1. Get auth credentials for the image reference.
 	keyChain, err := auth.GetKeyChainByRef(imageRef, nil)
 	if err != nil {
@@ -155,12 +204,13 @@ func (f *DataFetcher) fetchFromRemote(ctx context.Context, imageRef string, blob
 	}
 	defer rc.Close()
 
-	// 4. Atomic write: write to tmp file, then rename to final path.
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
-		return errors.Wrapf(err, "create cache dir for %s", cachePath)
+	// 4. Write to tmp file, then rename to target path.
+	// This overwrites the sparse placeholder with actual blob data.
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		return errors.Wrapf(err, "create dir for %s", targetPath)
 	}
 
-	tmpPath := cachePath + ".tmp"
+	tmpPath := targetPath + ".download"
 	tmpFile, err := os.Create(tmpPath)
 	if err != nil {
 		return errors.Wrapf(err, "create temp file %s", tmpPath)
@@ -176,12 +226,12 @@ func (f *DataFetcher) fetchFromRemote(ctx context.Context, imageRef string, blob
 		return errors.Wrapf(err, "close temp file %s", tmpPath)
 	}
 
-	if err := os.Rename(tmpPath, cachePath); err != nil {
+	if err := os.Rename(tmpPath, targetPath); err != nil {
 		os.Remove(tmpPath)
-		return errors.Wrapf(err, "rename %s to %s", tmpPath, cachePath)
+		return errors.Wrapf(err, "rename %s to %s", tmpPath, targetPath)
 	}
 
-	log.L.Infof("filefs: fetched blob %s to cache %s", blobDigest, cachePath)
+	log.L.Infof("filefs: downloaded blob %s to %s", blobDigest, targetPath)
 	return nil
 }
 

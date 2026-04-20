@@ -68,10 +68,16 @@ type erofsDeviceSlot struct {
 	Reserved  [52]byte
 }
 
+// blobInfo holds metadata for an external blob referenced by the EROFS device table.
+type blobInfo struct {
+	ID   string // sha256 hex blob ID from device slot Tag
+	Size int64  // blob size in bytes, computed from BlocksLo/BlocksHi + BlkSzBits
+}
+
 // parseDeviceTable reads the EROFS superblock from the bootstrap file and
-// extracts blob IDs from the device table. Returns an empty slice (not an error)
-// if the image has no device table or no external devices.
-func parseDeviceTable(bootstrapPath string) ([]string, error) {
+// extracts blob IDs and sizes from the device table. Returns an empty slice
+// (not an error) if the image has no device table or no external devices.
+func parseDeviceTable(bootstrapPath string) ([]blobInfo, error) {
 	f, err := os.Open(bootstrapPath)
 	if err != nil {
 		return nil, errors.Wrapf(err, "open bootstrap %s", bootstrapPath)
@@ -107,7 +113,7 @@ func parseDeviceTable(bootstrapPath string) ([]string, error) {
 		return nil, errors.Wrapf(err, "seek to device table at offset %d", devTableOffset)
 	}
 
-	blobIDs := make([]string, 0, sb.ExtraDevices)
+	blobs := make([]blobInfo, 0, sb.ExtraDevices)
 	for i := uint16(0); i < sb.ExtraDevices; i++ {
 		var slot erofsDeviceSlot
 		if err := binary.Read(f, binary.LittleEndian, &slot); err != nil {
@@ -116,10 +122,19 @@ func parseDeviceTable(bootstrapPath string) ([]string, error) {
 
 		// Extract blob ID from the tag field (null-terminated sha256 hex string).
 		blobID := string(bytes.TrimRight(slot.Tag[:], "\x00"))
-		if blobID != "" {
-			blobIDs = append(blobIDs, blobID)
+		if blobID == "" {
+			continue
 		}
+
+		// Compute blob size: (BlocksHi<<32 | BlocksLo) << BlkSzBits
+		blocks := (uint64(slot.BlocksHi) << 32) | uint64(slot.BlocksLo)
+		blobSize := int64(blocks << sb.BlkSzBits)
+
+		blobs = append(blobs, blobInfo{
+			ID:   blobID,
+			Size: blobSize,
+		})
 	}
 
-	return blobIDs, nil
+	return blobs, nil
 }
