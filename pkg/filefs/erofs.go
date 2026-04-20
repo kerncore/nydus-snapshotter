@@ -60,12 +60,12 @@ type erofsSuperBlock struct {
 // erofsDeviceSlot mirrors the kernel's struct erofs_deviceslot (128 bytes).
 // Only the Tag field is needed for blob ID extraction.
 type erofsDeviceSlot struct {
-	Tag      [64]byte // sha256 hex blob ID, null-padded
-	BlocksLo uint32
-	UniAddr  uint32
-	BlocksHi uint16
+	Tag       [64]byte // sha256 hex blob ID, null-padded
+	BlocksLo  uint32
+	UniAddr   uint32
+	BlocksHi  uint16
 	UniAddrHi uint16
-	Reserved [52]byte
+	Reserved  [52]byte
 }
 
 // parseDeviceTable reads the EROFS superblock from the bootstrap file and
