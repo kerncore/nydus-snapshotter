@@ -181,8 +181,12 @@ func (f *DataFetcher) fetchBlobToFile(ctx context.Context, imageRef, blobID, tar
 	return sfErr
 }
 
-// downloadBlob downloads a blob from the remote registry and writes it to targetPath.
-// Writes to a temporary file first, then renames to the target for atomicity.
+// downloadBlob downloads a blob from the remote registry and writes it
+// directly to targetPath. The target file must already exist (as a sparse
+// placeholder created at mount time). We write to the SAME inode rather than
+// using tmp+rename, because the kernel already holds an fd to this file
+// (opened at mount via device=). A rename would create a new inode that
+// the kernel's fd cannot see.
 func (f *DataFetcher) downloadBlob(ctx context.Context, imageRef string, blobDigest digest.Digest, targetPath string) error {
 	// 1. Get auth credentials for the image reference.
 	keyChain, err := auth.GetKeyChainByRef(imageRef, nil)
@@ -204,31 +208,26 @@ func (f *DataFetcher) downloadBlob(ctx context.Context, imageRef string, blobDig
 	}
 	defer rc.Close()
 
-	// 4. Write to tmp file, then rename to target path.
-	// This overwrites the sparse placeholder with actual blob data.
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-		return errors.Wrapf(err, "create dir for %s", targetPath)
-	}
-
-	tmpPath := targetPath + ".download"
-	tmpFile, err := os.Create(tmpPath)
+	// 4. Write directly to the sparse blob file (same inode the kernel holds).
+	blobFile, err := os.OpenFile(targetPath, os.O_WRONLY, 0)
 	if err != nil {
-		return errors.Wrapf(err, "create temp file %s", tmpPath)
+		return errors.Wrapf(err, "open blob file %s for writing", targetPath)
 	}
 
-	if _, err := io.Copy(tmpFile, rc); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpPath)
-		return errors.Wrapf(err, "write blob data to %s", tmpPath)
-	}
-	if err := tmpFile.Close(); err != nil {
-		os.Remove(tmpPath)
-		return errors.Wrapf(err, "close temp file %s", tmpPath)
+	if _, err := io.Copy(blobFile, rc); err != nil {
+		blobFile.Close()
+		return errors.Wrapf(err, "write blob data to %s", targetPath)
 	}
 
-	if err := os.Rename(tmpPath, targetPath); err != nil {
-		os.Remove(tmpPath)
-		return errors.Wrapf(err, "rename %s to %s", tmpPath, targetPath)
+	// 5. Sync to disk before fanotify ALLOW — the kernel must see the data
+	// when it reads from this file immediately after we respond.
+	if err := blobFile.Sync(); err != nil {
+		blobFile.Close()
+		return errors.Wrapf(err, "sync blob file %s", targetPath)
+	}
+
+	if err := blobFile.Close(); err != nil {
+		return errors.Wrapf(err, "close blob file %s", targetPath)
 	}
 
 	log.L.Infof("filefs: downloaded blob %s to %s", blobDigest, targetPath)
