@@ -9,6 +9,7 @@
 package filefs
 
 import (
+	"context"
 	"fmt"
 	"unsafe"
 
@@ -40,6 +41,9 @@ const (
 
 	// Size of struct fanotify_event_metadata.
 	fanotifyEventMetadataSize = 24
+
+	// Maximum number of times to restart the event loop after a panic.
+	maxEventLoopRestarts = 3
 )
 
 // fanotifyEventMetadata mirrors the kernel's struct fanotify_event_metadata.
@@ -90,20 +94,43 @@ func (m *Manager) setupFanotify(st *snapshotState, mountPoint string) error {
 
 	log.L.Infof("Fanotify pre-content listener set up on %s (fd=%d)", mountPoint, fd)
 
-	// Start the event processing goroutine with panic recovery.
+	// Start the event processing goroutine with panic recovery and restart.
 	// A panicked or crashed event loop would leave kernel I/O blocked
-	// indefinitely, so we recover and drain pending events with FAN_DENY.
+	// indefinitely, so we recover, drain pending events, and retry.
+	st.wg.Add(1)
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.L.Errorf("fanotify: event loop panicked: %v", r)
-				m.drainPendingEvents(st)
+		defer st.wg.Done()
+		for attempt := 0; attempt <= maxEventLoopRestarts; attempt++ {
+			normalExit := m.runEventLoop(st, attempt)
+			if normalExit {
+				return // stopCh was closed, clean shutdown
 			}
-		}()
-		m.fanotifyEventLoop(st)
+			// Check if we should stop before restarting.
+			select {
+			case <-st.stopCh:
+				return
+			default:
+			}
+		}
+		log.L.Errorf("fanotify: event loop exhausted %d restart attempts", maxEventLoopRestarts)
 	}()
 
 	return nil
+}
+
+// runEventLoop runs the fanotify event loop with panic recovery.
+// Returns true if the loop exited normally (stopCh closed), false if it panicked.
+func (m *Manager) runEventLoop(st *snapshotState, attempt int) (normalExit bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.L.Errorf("fanotify: event loop panicked (attempt %d/%d): %v",
+				attempt+1, maxEventLoopRestarts+1, r)
+			m.drainPendingEvents(st)
+			normalExit = false
+		}
+	}()
+	m.fanotifyEventLoop(st)
+	return true
 }
 
 // fanotifyEventLoop reads fanotify events and handles on-demand data loading.
@@ -200,7 +227,7 @@ func (m *Manager) handleFanotifyEvents(st *snapshotState, buf []byte) {
 }
 
 // handlePreAccessEvent processes a single FAN_PRE_ACCESS event.
-// It determines which blob data is needed, fetches it, and responds to the kernel.
+// It ensures all blobs for the snapshot are fetched, then allows the access.
 // The event fd is always closed to prevent fd leaks.
 func (m *Manager) handlePreAccessEvent(st *snapshotState, meta *fanotifyEventMetadata) {
 	if meta.Fd < 0 {
@@ -211,30 +238,39 @@ func (m *Manager) handlePreAccessEvent(st *snapshotState, meta *fanotifyEventMet
 	// Ensure the event fd is always closed regardless of outcome.
 	defer unix.Close(int(meta.Fd))
 
-	// Read the file path from /proc/self/fd/<fd> to identify the file being accessed.
-	// This can fail if the file was deleted between event receipt and resolution.
-	fdPath := procFdPath(meta.Fd)
-	filePath, err := readlinkSafe(fdPath)
-	if err != nil {
-		log.L.WithError(err).Warnf("fanotify: failed to resolve fd %d path, denying access", meta.Fd)
+	// Ensure all blobs for this snapshot are available.
+	if err := m.ensureSnapshotBlobsFetched(st); err != nil {
+		log.L.WithError(err).Warn("fanotify: blob fetch failed, denying access")
 		m.sendFanotifyResponse(st, meta.Fd, fanotifyResponseDeny)
 		return
-	}
-
-	if filePath == "" {
-		log.L.Warnf("fanotify: readlink returned empty path for fd %d, denying access", meta.Fd)
-		m.sendFanotifyResponse(st, meta.Fd, fanotifyResponseDeny)
-		return
-	}
-
-	// Attempt to fetch the required data from cache or remote.
-	if err := m.fetcher.EnsureDataAvailable(filePath, st.backingFile); err != nil {
-		log.L.WithError(err).Warnf("fanotify: failed to ensure data for %s", filePath)
-		// Still allow the access — the kernel may handle partial data gracefully,
-		// or the process will get an I/O error from the filesystem itself.
 	}
 
 	m.sendFanotifyResponse(st, meta.Fd, fanotifyResponseAllow)
+}
+
+// ensureSnapshotBlobsFetched ensures all blobs referenced by the snapshot's
+// EROFS image are available in the local cache. Uses the snapshot context to
+// obtain the image reference for registry authentication.
+func (m *Manager) ensureSnapshotBlobsFetched(st *snapshotState) error {
+	if len(st.blobIDs) == 0 {
+		return nil
+	}
+
+	// Look up the image reference for auth credentials.
+	// We need the manager lock briefly to read the snapshot context.
+	m.mu.Lock()
+	var imageRef string
+	for sid, s := range m.snapshots {
+		if s == st {
+			if sctx, ok := m.snapshotContexts[sid]; ok {
+				imageRef = sctx.imageRef
+			}
+			break
+		}
+	}
+	m.mu.Unlock()
+
+	return m.fetcher.EnsureAllBlobsFetched(context.Background(), imageRef, st.blobIDs)
 }
 
 // sendFanotifyResponse writes a fanotify_response struct to allow or deny an event.
@@ -251,6 +287,9 @@ func (m *Manager) sendFanotifyResponse(st *snapshotState, fd int32, response uin
 
 // procFdPath returns the /proc/self/fd/<fd> path for resolving an fd's target.
 func procFdPath(fd int32) string {
+	if fd < 0 {
+		return ""
+	}
 	// Use a byte buffer to avoid fmt.Sprintf allocations in the hot path.
 	const prefix = "/proc/self/fd/"
 	buf := make([]byte, len(prefix)+10)
@@ -324,7 +363,7 @@ func (m *Manager) drainPendingEvents(st *snapshotState) {
 	}
 }
 
-// String representation for fanotify response codes (for debugging).
+// fanotifyResponseString returns a string representation for fanotify response codes (for debugging).
 func fanotifyResponseString(r uint32) string {
 	switch r {
 	case fanotifyResponseAllow:

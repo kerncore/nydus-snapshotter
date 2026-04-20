@@ -46,37 +46,46 @@ func NewDataFetcher(cacheDirPath string, insecure bool) *DataFetcher {
 	}
 }
 
-// EnsureDataAvailable ensures that the data backing the given file path
-// within the EROFS mount is available. If the data is already cached locally,
-// this is a no-op. Otherwise, it fetches the data from the remote registry
-// and populates the cache.
-func (f *DataFetcher) EnsureDataAvailable(filePath, backingFile string) error {
-	// Determine the blob ID from the file path within the mount.
-	blobID := f.resolveBlobID(filePath)
-	if blobID == "" {
-		// Not a blob-backed file or resolution not possible, allow access.
+// EnsureAllBlobsFetched ensures all blobs referenced by the EROFS image are
+// available in the local cache. This is called on fanotify pre-access events
+// to ensure blob data is present before the kernel reads it.
+// The blob IDs are extracted from the EROFS device table at mount time.
+func (f *DataFetcher) EnsureAllBlobsFetched(ctx context.Context, imageRef string, blobIDs []string) error {
+	if len(blobIDs) == 0 {
 		return nil
 	}
 
-	// Fast path: check if this blob has already been fetched.
+	// Fast path: check if all blobs are already fetched.
 	f.mu.RLock()
-	if f.fetched[blobID] {
-		f.mu.RUnlock()
-		return nil
+	allFetched := true
+	for _, id := range blobIDs {
+		if !f.fetched[id] {
+			allFetched = false
+			break
+		}
 	}
 	f.mu.RUnlock()
-
-	// Check if the blob data exists in the local cache.
-	cachePath := filepath.Join(f.cacheDirPath, blobID)
-	if _, err := os.Stat(cachePath); err == nil {
-		// Data is already cached locally.
-		f.mu.Lock()
-		f.fetched[blobID] = true
-		f.mu.Unlock()
+	if allFetched {
 		return nil
 	}
 
-	return nil
+	// Fetch any missing blobs.
+	var firstErr error
+	for _, blobID := range blobIDs {
+		blobDigest, err := digest.Parse("sha256:" + blobID)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = errors.Wrapf(err, "invalid blob ID %s", blobID)
+			}
+			continue
+		}
+		if err := f.FetchBlob(ctx, imageRef, blobDigest); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 // FetchBlob fetches a blob by digest from the remote registry and stores it
@@ -113,20 +122,6 @@ func (f *DataFetcher) FetchBlob(ctx context.Context, imageRef string, blobDigest
 	f.fetched[blobID] = true
 	f.mu.Unlock()
 	return nil
-}
-
-// resolveBlobID extracts the blob identifier from a file path within the
-// EROFS mount. The exact mapping depends on the EROFS image format (RAFS v5/v6).
-func (f *DataFetcher) resolveBlobID(filePath string) string {
-	// For RAFS-formatted EROFS images, the blob ID is typically embedded
-	// in the EROFS metadata. During the pre-content access, we need to
-	// map the accessed file region back to the corresponding blob and offset.
-	//
-	// TODO: Implement proper blob ID resolution by reading EROFS/RAFS metadata
-	// to map file paths to their backing blob IDs and data ranges.
-	// For now, return empty to allow all accesses through.
-	log.L.Debugf("filefs fetcher: resolving blob for path %s", filePath)
-	return ""
 }
 
 // fetchFromRemote downloads a blob from the remote registry and saves it

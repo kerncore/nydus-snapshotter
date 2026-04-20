@@ -42,6 +42,10 @@ func TestProcFdPath(t *testing.T) {
 			fd:       10,
 			expected: "/proc/self/fd/10",
 		},
+		"negative fd": {
+			fd:       -1,
+			expected: "",
+		},
 	}
 
 	for name, tc := range tests {

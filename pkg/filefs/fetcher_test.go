@@ -96,13 +96,34 @@ func TestFetchBlob_SingleflightDedup(t *testing.T) {
 	assert.Equal(t, int32(0), requestCount.Load(), "all requests should hit cache")
 }
 
-func TestEnsureDataAvailable_AlreadyCached(t *testing.T) {
+func TestEnsureAllBlobsFetched_AllCached(t *testing.T) {
 	cacheDir := t.TempDir()
 	fetcher := NewDataFetcher(cacheDir, true)
 
-	// EnsureDataAvailable currently resolves blob ID to empty string for all paths,
-	// so it always returns nil. Test that the fast path works without errors.
-	err := fetcher.EnsureDataAvailable("/some/path", "/backing/file")
+	blob1 := []byte("blob1 data")
+	blob2 := []byte("blob2 data")
+	d1 := digest.FromBytes(blob1)
+	d2 := digest.FromBytes(blob2)
+
+	// Pre-create both blobs in cache.
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, d1.Hex()), blob1, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, d2.Hex()), blob2, 0644))
+
+	err := fetcher.EnsureAllBlobsFetched(context.Background(), "docker.io/library/test:latest", []string{d1.Hex(), d2.Hex()})
+	assert.NoError(t, err)
+
+	// Both should be marked as fetched.
+	fetcher.mu.RLock()
+	assert.True(t, fetcher.fetched[d1.Hex()])
+	assert.True(t, fetcher.fetched[d2.Hex()])
+	fetcher.mu.RUnlock()
+}
+
+func TestEnsureAllBlobsFetched_Empty(t *testing.T) {
+	fetcher := NewDataFetcher(t.TempDir(), true)
+
+	// Empty blob list should be a no-op.
+	err := fetcher.EnsureAllBlobsFetched(context.Background(), "docker.io/library/test:latest", nil)
 	assert.NoError(t, err)
 }
 
@@ -157,10 +178,21 @@ func TestFetchBlob_MarksFetchedAfterCacheHit(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestResolveBlobID_ReturnsEmpty(t *testing.T) {
-	fetcher := NewDataFetcher(t.TempDir(), true)
+func TestEnsureAllBlobsFetched_FastPathAfterFetch(t *testing.T) {
+	cacheDir := t.TempDir()
+	fetcher := NewDataFetcher(cacheDir, true)
 
-	// Current implementation always returns empty (TODO: implement proper resolution).
-	blobID := fetcher.resolveBlobID("/some/erofs/mount/path/file.txt")
-	assert.Empty(t, blobID, "resolveBlobID should return empty until proper resolution is implemented")
+	blob := []byte("test blob")
+	d := digest.FromBytes(blob)
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, d.Hex()), blob, 0644))
+
+	blobIDs := []string{d.Hex()}
+
+	// First call fetches from cache.
+	err := fetcher.EnsureAllBlobsFetched(context.Background(), "docker.io/library/test:latest", blobIDs)
+	require.NoError(t, err)
+
+	// Second call should hit the in-memory fast path.
+	err = fetcher.EnsureAllBlobsFetched(context.Background(), "docker.io/library/test:latest", blobIDs)
+	assert.NoError(t, err)
 }

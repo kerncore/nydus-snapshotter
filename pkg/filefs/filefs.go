@@ -14,7 +14,7 @@ package filefs
 
 import (
 	"os"
-	"path"
+	"path/filepath"
 	"sync"
 
 	"github.com/containerd/log"
@@ -41,9 +41,11 @@ type snapshotContext struct {
 
 type snapshotState struct {
 	mountPoint  string
-	backingFile string // path to the EROFS image file (bootstrap)
-	fanotifyFd  int    // fanotify file descriptor
+	backingFile string   // path to the EROFS image file (bootstrap)
+	blobIDs     []string // blob IDs from EROFS device table
+	fanotifyFd  int      // fanotify file descriptor
 	stopCh      chan struct{}
+	wg          sync.WaitGroup // tracks fanotify goroutine lifecycle
 }
 
 // NewManager creates a new file-backed EROFS mount manager.
@@ -65,7 +67,7 @@ func (m *Manager) MountFileErofs(snapshotID string, r *rafs.Rafs) error {
 		return errors.Wrapf(err, "find bootstrap for snapshot %s", snapshotID)
 	}
 
-	mountPoint := path.Join(r.GetSnapshotDir(), "mnt")
+	mountPoint := filepath.Join(r.GetSnapshotDir(), "mnt")
 	if err := os.MkdirAll(mountPoint, 0750); err != nil {
 		return errors.Wrapf(err, "create mount dir %s", mountPoint)
 	}
@@ -79,9 +81,19 @@ func (m *Manager) MountFileErofs(snapshotID string, r *rafs.Rafs) error {
 	}
 	log.L.Infof("File-backed EROFS mounted at %s from %s", mountPoint, bootstrapFile)
 
+	// Parse the EROFS device table to discover referenced blob IDs.
+	blobIDs, err := parseDeviceTable(bootstrapFile)
+	if err != nil {
+		log.L.WithError(err).Warnf("filefs: failed to parse device table from %s, on-demand fetching may not work", bootstrapFile)
+	}
+	if len(blobIDs) > 0 {
+		log.L.Infof("filefs: discovered %d blob(s) in EROFS device table for snapshot %s", len(blobIDs), snapshotID)
+	}
+
 	st := &snapshotState{
 		mountPoint:  mountPoint,
 		backingFile: bootstrapFile,
+		blobIDs:     blobIDs,
 		fanotifyFd:  -1,
 		stopCh:      make(chan struct{}),
 	}
@@ -133,10 +145,11 @@ func (m *Manager) UmountFileErofs(snapshotID string) error {
 	delete(m.snapshotContexts, snapshotID)
 	m.mu.Unlock()
 
-	// Signal the fanotify goroutine to stop.
+	// Signal the fanotify goroutine to stop and wait for it to exit.
 	close(st.stopCh)
+	st.wg.Wait()
 
-	// Close fanotify fd to unblock any pending reads.
+	// Close fanotify fd after the goroutine has exited.
 	if st.fanotifyFd >= 0 {
 		unix.Close(st.fanotifyFd)
 		st.fanotifyFd = -1
