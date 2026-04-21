@@ -28,10 +28,6 @@ const (
 
 	// Size of struct erofs_deviceslot on disk.
 	erofsDeviceSlotSize = 128
-
-	// Size of the on-disk superblock struct we need to read.
-	// We only need fields up to devt_slotoff at offset 88 (2 bytes), so 90 bytes suffice.
-	erofsSuperReadSize = 90
 )
 
 // erofsSuperBlock mirrors the first 90 bytes of the on-disk erofs_super_block.

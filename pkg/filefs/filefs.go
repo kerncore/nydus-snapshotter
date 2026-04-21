@@ -42,14 +42,14 @@ type snapshotContext struct {
 }
 
 type snapshotState struct {
-	mountPoint      string
-	backingFile     string     // path to the EROFS image file (bootstrap)
-	blobs           []blobInfo // blob metadata from EROFS device table
-	blobDir         string     // directory containing blob sparse files
-	fanotifyFd      int        // fanotify file descriptor
-	stopCh          chan struct{}
-	wg              sync.WaitGroup     // tracks fanotify goroutine lifecycle
-	cancelPrefetch  context.CancelFunc // cancels in-progress blob prefetch
+	mountPoint     string
+	backingFile    string             // path to the EROFS image file (bootstrap)
+	blobs          []blobInfo         // blob metadata from EROFS device table
+	blobDir        string             // directory containing blob sparse files
+	fanotifyFd     int                // fanotify file descriptor
+	stopCh         chan struct{}      // signals fanotify goroutine to stop
+	wg             sync.WaitGroup     // tracks fanotify goroutine lifecycle
+	cancelPrefetch context.CancelFunc // cancels in-progress blob prefetch
 }
 
 // NewManager creates a new file-backed EROFS mount manager.
