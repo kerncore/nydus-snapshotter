@@ -162,7 +162,8 @@ func (m *Manager) recoverRafsInstances(ctx context.Context,
 		}
 
 		log.L.Debugf("found RAFS instance %#v", r)
-		if r.GetFsDriver() == config.FsDriverFscache || r.GetFsDriver() == config.FsDriverFusedev {
+		switch r.GetFsDriver() {
+		case config.FsDriverFscache, config.FsDriverFusedev:
 			d := (*recoveringDaemons)[r.DaemonID]
 			if d != nil {
 				d.AddRafsInstance(r)
@@ -172,7 +173,7 @@ func (m *Manager) recoverRafsInstances(ctx context.Context,
 				d.AddRafsInstance(r)
 			}
 			rafs.RafsGlobalCache.Add(r)
-		} else if r.GetFsDriver() == config.FsDriverBlockdev {
+		case config.FsDriverBlockdev, config.FsDriverFile:
 			rafs.RafsGlobalCache.Add(r)
 		}
 
